@@ -1,127 +1,156 @@
 import os
 import boto3
-import pandas as pd
-from geopy.distance import geodesic
-from flask import Flask, request, jsonify
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, ImageMessage, TextSendMessage
-from PIL import Image
-from datetime import datetime
-import piexif
-from aws_secretsmanager_caching import SecretCache, SecretCacheConfig
 import json
+from flask import Flask, request, abort
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, ImageMessage, TextSendMessage
+from aws_secretsmanager_caching import SecretCache, SecretCacheConfig
+from PIL import Image
+from PIL.ExifTags import TAGS
 
+# 初始化 Flask 應用
 app = Flask(__name__)
 
-# 從 AWS Secrets Manager 取得憑證
-def get_aws_credentials():
-    session = boto3.session.Session()
-    client = session.client('secretsmanager')
-    secret_name = "YOUR_SECRET_NAME"
+# 設定 AWS Secrets Manager 的客戶端
+secrets_client = boto3.client('secretsmanager', region_name='YOUR_AWS_REGION')
+cache_config = SecretCacheConfig()
+cache = SecretCache(config=cache_config, client=secrets_client)
 
-    secret_value = client.get_secret_value(SecretId=secret_name)
-    secret = json.loads(secret_value['SecretString'])
-    return secret['AWS_ACCESS_KEY'], secret['AWS_SECRET_KEY'], secret['AWS_REGION']
+# 抓取金鑰資料（從 AWS Secrets Manager 中讀取）
+secret_name = 'YOUR_SECRET_NAME'
+secret = json.loads(cache.get_secret_string(secret_name))
 
-aws_access_key, aws_secret_key, aws_region = get_aws_credentials()
+# 從密鑰中讀取 LINE 和 AWS 金鑰
+line_bot_api = LineBotApi(secret['line_channel_access_token'])
+handler = WebhookHandler(secret['line_channel_secret'])
+aws_access_key_id = secret['aws_access_key_id']
+aws_secret_access_key = secret['aws_secret_access_key']
+s3_bucket_name = secret['s3_bucket_name']
+dynamodb_table_name = secret['dynamodb_table_name']
 
-# 初始化 AWS 客戶端
-rekognition_client = boto3.client('rekognition', region_name=aws_region)
-dynamodb = boto3.resource('dynamodb', region_name=aws_region)
-table = dynamodb.Table('YOUR_DYNAMODB_TABLE')
+# 初始化 Rekognition 和 DynamoDB 客戶端
+rekognition_client = boto3.client(
+    'rekognition',
+    aws_access_key_id=aws_access_key_id,
+    aws_secret_access_key=aws_secret_access_key,
+    region_name='YOUR_AWS_REGION'
+)
+dynamodb_client = boto3.resource(
+    'dynamodb',
+    aws_access_key_id=aws_access_key_id,
+    aws_secret_access_key=aws_secret_access_key,
+    region_name='YOUR_AWS_REGION'
+)
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=aws_access_key_id,
+    aws_secret_access_key=aws_secret_access_key,
+    region_name='YOUR_AWS_REGION'
+)
+table = dynamodb_client.Table(dynamodb_table_name)
 
-# LineBot 設置 (這裡的密鑰也可使用 Secrets Manager 儲存)
-line_bot_api = LineBotApi('YOUR_CHANNEL_ACCESS_TOKEN')
-handler = WebhookHandler('YOUR_CHANNEL_SECRET')
+# LINE Webhook Callback
+@app.route("/callback", methods=['POST'])
+def callback():
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+    app.logger.info(f"Request body: {body}")
 
-# 1. 從圖片提取座標
-def get_image_geolocation(image_path):
-    image = Image.open(image_path)
-    exif_data = piexif.load(image.info['exif'])
-    gps_info = exif_data['GPS']
-    lat = gps_info[2]
-    lng = gps_info[4]
-    # 轉換成十進位格式
-    lat_dec = lat[0] + lat[1]/60 + lat[2]/3600
-    lng_dec = lng[0] + lng[1]/60 + lng[2]/3600
-    return lat_dec, lng_dec
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
 
-# 2. 使用座標查找最近的公路段與里程
-def find_closest_road_marker(lat, lng, csv_file_path):
-    df = pd.read_csv(csv_file_path)
-    input_coords = (lat, lng)
-    df['距離'] = df.apply(lambda row: geodesic(input_coords, (row['Y座標'], row['X座標'])).meters, axis=1)
-    closest_row = df.loc[df['距離'].idxmin()]
-    closest_road = closest_row['公路編號']
-    closest_mileage = closest_row['牌面內容']
-    return closest_road, closest_mileage
+    return 'OK'
 
-# 3. 使用 AWS Rekognition 辨識災害類型
-def detect_disaster_type(image_bytes):
-    response = rekognition_client.detect_labels(Image={'Bytes': image_bytes}, MaxLabels=10)
-    labels = [label['Name'] for label in response['Labels']]
-    disaster_type = None
-    if 'Landslide' in labels:
-        disaster_type = '道路坍方'
-    elif 'Rockfall' in labels:
-        disaster_type = '落石'
-    elif 'Mudslide' in labels:
-        disaster_type = '土石流'
-    
-    people_detected = 'Person' in labels
-    vehicles_detected = 'Vehicle' in labels
-    return disaster_type, people_detected, vehicles_detected
-
-# 4. 處理 LINE 圖片訊息事件
+# 接收來自 LINE 的圖片訊息
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     message_content = line_bot_api.get_message_content(event.message.id)
-    image_path = 'temp_image.jpg'
+    image_bytes = message_content.content
     
-    with open(image_path, 'wb') as fd:
-        for chunk in message_content.iter_content():
-            fd.write(chunk)
+    # 將圖片存入 S3
+    s3_key = f"disaster_photos/{event.message.id}.jpg"
+    s3_client.put_object(Bucket=s3_bucket_name, Key=s3_key, Body=image_bytes)
     
-    # 從圖片提取座標
-    lat, lng = get_image_geolocation(image_path)
-
-    # 查找最近的公路與里程
-    closest_road, closest_mileage = find_closest_road_marker(lat, lng, '/mnt/data/(11309)14省道公路路線里程牌(指45)KMZ.csv')
-
-    # 辨識災害類型與現場是否有人車
-    with open(image_path, 'rb') as image_file:
-        image_bytes = image_file.read()
-        disaster_type, people_detected, vehicles_detected = detect_disaster_type(image_bytes)
-
-    # 生成報告
-    photo_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    report_id = f"P{closest_road}{photo_time[:4]}0001"  # 根據公路編號與年份生成流水號
-    upload_time = datetime.now().isoformat()
-
-    # 確認訊息
-    description = f"災害類型: {disaster_type}, 坐標: 經度 {lng}, 緯度 {lat}, 公路段: {closest_road} {closest_mileage}, " \
-                  f"照片時間: {photo_time}, 是否有人車: {'有人' if people_detected else '無人'}, {'有車' if vehicles_detected else '無車'}"
+    # 用 AWS Rekognition 辨識圖片
+    response = rekognition_client.detect_labels(
+        Image={'Bytes': image_bytes},
+        MaxLabels=10,
+        MinConfidence=75
+    )
     
-    # 存入 DynamoDB
+    disaster_type = classify_disaster(response['Labels'])
+    
+    # 抓取照片的時間與座標（用 EXIF 提取）
+    image = Image.open(image_bytes)
+    photo_time, lat, lng = extract_exif_data(image)
+    
+    # 確認並回傳資料給用戶
+    report_message = generate_report_message(
+        disaster_type=disaster_type,
+        lat=lat, 
+        lng=lng, 
+        photo_time=photo_time
+    )
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report_message))
+
+    # 確認後將資料寫入 DynamoDB
+    report_id = generate_report_id()
+    upload_time = "2024-09-24T17:05:00Z"  # 這裡可以用 time 模組來自動生成
+
     table.put_item(
         Item={
             'report_id': report_id,
             'disaster_type': disaster_type,
-            'location': f"{closest_road} {closest_mileage}",
             'coordinates': {'lat': str(lat), 'lng': str(lng)},
             'timestamp': upload_time,
             'created_at': photo_time,
             'reporter_id': event.source.user_id,
-            'description': description
+            's3_photo_key': s3_key  # 儲存 S3 的 Key 以便後續查詢
         }
     )
-    
-    # 回傳確認訊息給使用者
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=description)
-    )
+
+# 災害類型的分類邏輯
+def classify_disaster(labels):
+    disaster_types = ["Rockfall", "Road Collapse", "Landslide"]
+    for label in labels:
+        if label['Name'] in disaster_types:
+            return label['Name']
+    return "Unknown"
+
+# 生成回報訊息
+def generate_report_message(disaster_type, lat, lng, photo_time):
+    return f"災害類型：{disaster_type}\n座標及定位：經度: {lng}, 緯度: {lat}\n照片時間：{photo_time}"
+
+# 生成報告編號
+def generate_report_id():
+    return f"R{str(32).zfill(4)}"  # 假設 32 是報告的序號
+
+# 提取 EXIF 數據
+def extract_exif_data(image):
+    exif_data = image._getexif()
+    photo_time = None
+    lat = None
+    lng = None
+    if exif_data:
+        for tag, value in exif_data.items():
+            tag_name = TAGS.get(tag, tag)
+            if tag_name == 'DateTimeOriginal':
+                photo_time = value
+            if tag_name == 'GPSInfo':
+                gps_info = value
+                lat = convert_gps(gps_info[2])  # 轉換 GPS 座標
+                lng = convert_gps(gps_info[4])
+    return photo_time, lat, lng
+
+# 將 GPS 座標轉換為十進位制
+def convert_gps(gps_data):
+    degrees = gps_data[0][0] / gps_data[0][1]
+    minutes = gps_data[1][0] / gps_data[1][1]
+    seconds = gps_data[2][0] / gps_data[2][1]
+    return degrees + (minutes / 60.0) + (seconds / 3600.0)
 
 if __name__ == "__main__":
     app.run()
-
